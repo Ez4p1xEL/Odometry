@@ -1,7 +1,14 @@
 #include <Wire.h>
 #include <MPU6050_tockn.h>
+#include <SimpleKalmanFilter.h>
 
 MPU6050 mpu6050(Wire);
+
+// 參數依序為：
+// 1. e_mea: 測量雜訊 R (例如陀螺儀雜訊，約 0.05 ~ 0.2)
+// 2. e_est: 估計誤差 P 的初始值 (一般給跟 e_mea 差不多)
+// 3. q:     過程雜訊 Q (隨時間變化的快慢，約 0.001 ~ 0.05)
+SimpleKalmanFilter gyroKalman(0.1, 0.1, 0.01);
 
 // LEFT PINS
 const int ENC1_A = 18;
@@ -28,12 +35,12 @@ const int8_t QUAD_TABLE[16] = {
    0,  1, -1,  0
 };
 
-const float diameter = 6; // in cm
-const float TICKS_PER_CENTIMETER = 448;
-const float LENGTH_PER_CIRCLE = diameter*3.14159;
-const float TICKS_PER_CIRCLE = LENGTH_PER_CIRCLE*TICKS_PER_CENTIMETER; // in ticks
 const float pi = 3.141519;
-const float L = 2; // 兩輪接觸點之間距離
+const float diameter = 60; // in mm
+const float TICKS_PER_MILLIMETER = 44.8;
+const float LENGTH_PER_CIRCLE = diameter*pi;
+const float TICKS_PER_CIRCLE = LENGTH_PER_CIRCLE*TICKS_PER_MILLIMETER; // in ticks
+const float L = 4; // 兩輪中心之間距離
 
 /* Legacy:
  40厘米，走8500-115=8385
@@ -43,19 +50,23 @@ const float L = 2; // 兩輪接觸點之間距離
 
 // 17919 = 448
 
-const float WHEEL_DIAMETER_MM = diameter *10;
-const int CPR = 2048 * 4; // 4倍頻
+const float WHEEL_DIAMETER_MM = diameter; // in mm
+const int CPR = 8192;
 const float MM_PER_TICK = (3.141519 * WHEEL_DIAMETER_MM) / CPR;
 const float COS45 = 0.70710678; // cos(45°)
-
-
+float initial_offset = 0.0f;
+const int SAMPLES = 200;
+const float dynamic_offset = 0.0f;
+float current_k = 0.02f;
+float updated_drift = 0.0f;
+float gyro_bias = 0.0f;
 
 /*
 */
 
 float predictAngle(float ticksL, float ticksR, float previousAngle) {
-  float left = (ticksL/CPR) * 2*pi;
-  float right = (ticksR/CPR) * 2*pi;
+  float left = (ticksL/CPR) * pi;
+  float right = (ticksR/CPR) * pi;
 
   // 計算滾動距離
   float distanceLeft = left * diameter;
@@ -64,6 +75,17 @@ float predictAngle(float ticksL, float ticksR, float previousAngle) {
   float delta = (distanceRight - distanceLeft)/L;
   return previousAngle + delta;
   
+}
+
+float getResidual(float delta_s_l, float delta_s_r ) {
+  float omega_imu = mpu6050.getGyroZ() * (pi / 180.0f);
+  float omega_enc = (delta_s_r - delta_s_l) / (L*0.02);
+  return omega_imu - (omega_enc + dynamic_offset);
+}
+
+void fixOffset(float leftDistance, float rightDistance, float residual, float predictedAngle) {
+  float fixedAngle = predictedAngle + (current_k * residual * 0.02);
+  updated_drift = gyro_bias + ((1-current_k) * residual);
 }
 
 // 一號中斷服務函數
@@ -88,7 +110,7 @@ void IRAM_ATTR isr_enc2() {
 
 float calculateLength(float startingTick, float endingTick) {
   float ticks = endingTick - startingTick;
-  return ticks/TICKS_PER_CENTIMETER;
+  return ticks/TICKS_PER_MILLIMETER;
 }
 
 float calculateForwardDistance(long deltaTick1, long deltaTick2) {
@@ -152,6 +174,21 @@ void loop() {
 
   manual_yaw += gz * dt;
 
+  // 假設這是 MPU6050 讀到的角速度 (rad/s)
+    float raw_gyro_z = 0.52; 
+
+    // 一行代碼完成卡爾曼更新！
+    // 庫內部會自動更新 P，並計算當前的 K，然後輸出濾波後的估計值
+    float clean_gyro_z = gyroKalman.updateEstimate(raw_gyro_z);
+
+    // ★ 直接獲取庫當前算出來的 K 值 (卡爾曼增益，介於 0 與 1 之間)
+    current_k = gyroKalman.getKalmanGain();
+    
+    float res = getResidual(calculateLength(0,count1), calculateLength(0,count2));
+    float pA = predictAngle(count1,count2,manual_yaw);
+    gyro_bias = gyro_bias + (current_k * res);
+    fixOffset(calculateLength(0,count1), calculateLength(0,count2), res, pA);
+
   // 每 100ms 印出一次數據
   if (millis() - timer > 100) {
     timer = millis();
@@ -160,16 +197,18 @@ void loop() {
     float yaw = mpu6050.getAngleZ();
 
     Serial.print("L: ");
-    Serial.print(calculateLength(0, count1), 2);
+    Serial.print(calculateLength(0, count1)/10, 2);
     Serial.print("cm | R: ");
-    Serial.print(calculateLength(0, count2), 2);
+    Serial.print(calculateLength(0, count2)/10, 2);
     Serial.print("cm | 車頭 Yaw: ");
     Serial.print(manual_yaw, 2);
     Serial.println(" 度");
 
     Serial.println(count1);
     Serial.print("預測角度: ");
-    Serial.println(predictAngle(count1,count2,manual_yaw));
+    Serial.println(pA);
+    Serial.print("修正角度：");
+    Serial.println(yaw - updated_drift);
   }
 
   //delay(20); // 约 50Hz 采样频率
