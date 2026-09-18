@@ -178,7 +178,6 @@ void setup() {
   // 3. 自動靜止校準（開機請保持小車不動大約 2~3 秒）
   Serial.println("正在校準陀螺儀 Offset，請保持小車完全靜止...");
   mpu6050.calcGyroOffsets(true); // true 會在串口印出校準進度
-  mpu6050.calcGyroOffsets(true);
 
   measureGyroBias();
   manual_yaw = 0.0f;
